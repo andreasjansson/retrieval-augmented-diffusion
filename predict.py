@@ -25,10 +25,46 @@ from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
 
 
+DATABASE_NAMES = [
+    "cars",
+    "coco",
+    "country211",
+    "emotes",
+    "faces",
+    "food",
+    "laion-aesthetic",
+    "openimages",
+    "pokemon",
+    "prompt-engineer",
+    "simulacra",
+]
+INIT_DATABASES = ["simulacra", "laion-aesthetic"] # start on cold boot, others will be loaded on first request
+
 @lru_cache(maxsize=None)  # cache the model, so we don't have to load it every time
 def load_clip(clip_model="ViT-L/14", use_jit=True, device="cpu"):
     clip_model, preprocess = clip.load(clip_model, device=device, jit=use_jit)
     return clip_model, preprocess
+
+
+@torch.no_grad()
+def knn_search(query: torch.Tensor, num_results: int, image_index):
+    query = query.squeeze(0).cpu().detach().numpy().astype("float32")
+    distances, indices, embeddings = image_index.search_and_reconstruct(
+        query, num_results
+    )
+    results = indices[0]  # first element is a list of indices
+    nb_results = np.where(results == -1)[0]
+    if len(nb_results) > 0:
+        nb_results = nb_results[0]
+    else:
+        nb_results = len(results)
+    result_indices = results[:nb_results]
+    result_distances = distances[0][:nb_results]
+    result_embeddings = embeddings[0][:nb_results]
+    result_embeddings = torch.from_numpy(result_embeddings.astype("float32"))
+    result_embeddings /= result_embeddings.norm(dim=-1, keepdim=True)
+    result_embeddings = result_embeddings.unsqueeze(0)
+    return result_distances, result_indices, result_embeddings
 
 
 @torch.no_grad()
@@ -98,7 +134,7 @@ def build_searcher(database_name: str):
     )
     assert image_index_path.exists(), f"database at {image_index_path} does not exist"
     print(f"Loading semantic index from {image_index_path}")
-    metadata_path = Path("data", "rdm", "searchers", database_name, "metadata")
+    metadata_path = Path("data", "rdm", "faissJ_indices", database_name, "metadata")
     return {
         "image_index": load_index(
             str(image_index_path), enable_faiss_memory_mapping=True
@@ -107,7 +143,6 @@ def build_searcher(database_name: str):
         if metadata_path.exists()
         else None,
     }
-
 
 class Predictor(BasePredictor):
     def __init__(self):
@@ -130,50 +165,10 @@ class Predictor(BasePredictor):
 
         self.sampler = PLMSSampler(self.model)
         print("Using PLMS sampler")
-
-        self.database_names = (
-            [  # TODO you have to copy this to the predict arg any time it is changed.
-                "cars",
-                "coco",
-                "country211",
-                "emotes",
-                "faces",
-                "food",
-                "laion-aesthetic",
-                "openimages",
-                "pokemon",
-                "prompt-engineer",
-                "simulacra",
-            ]
-        )
         self.searchers = {
             database_name: build_searcher(database_name)
-            for database_name in self.database_names
+            for database_name in INIT_DATABASES
         }
-
-    @torch.no_grad()
-    def knn_search(self, query: torch.Tensor, num_results: int, database_name: str):
-        # TODO rewrite this method
-        print(f"Running knn search with {database_name}")
-        knn_index = self.searchers[database_name]["image_index"]
-        query = query.squeeze(0)
-        query = query.cpu().detach().numpy().astype("float32")
-        distances, indices, embeddings = knn_index.search_and_reconstruct(
-            query, num_results
-        )
-        results = indices[0]  # first element is a list of indices
-        nb_results = np.where(results == -1)[0]
-        if len(nb_results) > 0:
-            nb_results = nb_results[0]
-        else:
-            nb_results = len(results)
-        result_indices = results[:nb_results]
-        result_distances = distances[0][:nb_results]
-        result_embeddings = embeddings[0][:nb_results]
-        result_embeddings = torch.from_numpy(result_embeddings.astype("float32"))
-        result_embeddings /= result_embeddings.norm(dim=-1, keepdim=True)
-        result_embeddings = result_embeddings.unsqueeze(0)
-        return result_distances, result_indices, result_embeddings
 
     @torch.inference_mode()
     def predict(
@@ -226,13 +221,16 @@ class Predictor(BasePredictor):
     ) -> List[Path]:
         self.output_directory = Path(tempfile.mkdtemp())
 
+        if database_name not in self.searchers: # Load any new searchers
+            self.searchers[database_name] = build_searcher(database_name)
+
         prompt_embedding = encode_text_with_clip_model(
             text=prompt, clip_model=self.clip_model, normalize=True, device=self.device
         )
-        knn_distances, knn_indices, knn_embeddings = self.knn_search(
+        knn_distances, knn_indices, knn_embeddings = knn_search(
             query=prompt_embedding,
             num_results=num_database_results,
-            database_name=database_name,
+            image_index=self.searchers[database_name]["image_index"],
         )
         if self.searchers[database_name]["metadata_provider"] is not None:
             search_results = map_to_metadata(
