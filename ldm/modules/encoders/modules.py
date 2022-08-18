@@ -141,7 +141,7 @@ class FrozenCLIPTextEmbedder(nn.Module):
     """
     def __init__(self, version='ViT-L/14', device="cuda", max_length=77, n_repeat=1, normalize=True):
         super().__init__()
-        self.model, _ = clip.load(version, jit=False, device="cpu")
+        self.model, _ = clip.load(version, jit=False, device=device)
         self.device = device
         self.max_length = max_length
         self.n_repeat = n_repeat
