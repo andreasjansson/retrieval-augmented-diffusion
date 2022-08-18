@@ -134,7 +134,7 @@ def build_searcher(database_name: str):
     )
     assert image_index_path.exists(), f"database at {image_index_path} does not exist"
     print(f"Loading semantic index from {image_index_path}")
-    metadata_path = Path("data", "rdm", "faissJ_indices", database_name, "metadata")
+    metadata_path = Path("data", "rdm", "faiss_indices", database_name, "metadata")
     return {
         "image_index": load_index(
             str(image_index_path), enable_faiss_memory_mapping=True
@@ -220,7 +220,7 @@ class Predictor(BasePredictor):
         ),
     ) -> List[Path]:
         self.output_directory = Path(tempfile.mkdtemp())
-
+        
         if database_name not in self.searchers: # Load any new searchers
             self.searchers[database_name] = build_searcher(database_name)
 
