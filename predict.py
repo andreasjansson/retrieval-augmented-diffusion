@@ -194,9 +194,9 @@ class Predictor(BasePredictor):
                 "simulacra",
             ],
         ),
-        prompt_scale: float = Input(
+        scale: float = Input(
             default=5.0,
-            description="Determines influence of your prompt on generation.",
+            description="Classifier-free unconditional scale for the PLMS sampler.",
         ),
         num_database_results: int = Input(
             default=10,
@@ -256,7 +256,7 @@ class Predictor(BasePredictor):
                 sample_conditioning, "1 k d -> b k d", b=num_generations
             )
         unconditional_clip_embed = None
-        if prompt_scale != 1.0:
+        if scale != 1.0:
             unconditional_clip_embed = torch.zeros_like(sample_conditioning)
         with self.model.ema_scope():
             shape = [
@@ -270,7 +270,7 @@ class Predictor(BasePredictor):
                 batch_size=sample_conditioning.shape[0],
                 shape=shape,
                 verbose=False,
-                unconditional_guidance_scale=prompt_scale,
+                unconditional_guidance_scale=scale,
                 unconditional_conditioning=unconditional_clip_embed,
                 # eta=0.0,
             )
