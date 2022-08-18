@@ -195,23 +195,26 @@ class Predictor(BasePredictor):
             description="Seed for the random number generator. Set to -1 to use a random seed.",
         ),
     ) -> List[CaptionedImage]:
+        if len(prompts.strip()) == 0:
+            raise ValueError("No prompts provided")
+        
+        prompts = prompts.split("|")
+        if len(prompts) > PROMPT_UPPER_BOUND:
+            raise ValueError("You can only use up to 8 prompts. Try again using fewer `|` separators. Make sure to remove `|` characters from your captions if they are present.")
+        print(f"Prompts: {prompts}")
+
         set_seed(seed)
+        print(f"Seed: {seed}")
+
+        clip_text_embed = self.clip_text_model.encode(prompts)
+        print(f"CLIP Text Embed: {clip_text_embed.shape}")
+
         if ddim_sampling:
             print("Using ddim sampling")
             sampler = DDIMSampler(self.model)
         else:
             print("Using plms sampling")
             sampler = PLMSSampler(self.model)
-
-        prompts = prompts.split("|")
-        if len(prompts) == 0:
-            raise ValueError("No prompts provided")
-        if len(prompts) > PROMPT_UPPER_BOUND:
-            raise ValueError("You can only use up to 8 prompts. Try again using fewer `|` separators. Make sure to remove `|` characters from your captions if they are present.")
-        print(f"Prompts: {prompts}")
-
-        clip_text_embed = self.clip_text_model.encode(prompts)
-        print(f"CLIP Text Embed: {clip_text_embed.shape}")
 
         if use_database:
             if database_name not in self.searchers:  # Load any new searchers
