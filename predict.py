@@ -1,25 +1,23 @@
 import random
 import re
-from cog import BasePredictor, Input, Path, BaseModel
-import warnings
-
-from clip_retrieval.clip_back import ParquetMetadataProvider, load_index, meta_to_dict
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
-from ldm.models.diffusion.plms import PLMSSampler
-from ldm.util import instantiate_from_config
-
 import sys
-from functools import lru_cache
-
 import tempfile
+import warnings
 from typing import List
 
 import numpy as np
 import torch
+from clip_retrieval.clip_back import load_index
+
+from cog import BaseModel, BasePredictor, Input, Path
 from einops import rearrange
 from omegaconf import OmegaConf
 from PIL import Image
+
+from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.models.diffusion.plms import PLMSSampler
+from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
+from ldm.util import instantiate_from_config
 
 sys.path.append("src/taming-transformers")
 warnings.filterwarnings("ignore")
@@ -54,18 +52,14 @@ def set_seed(seed):
 
 
 class CaptionedImage(BaseModel):
-    caption: str
     image: Path
+    caption: str
 
 
 def knn_search(query: torch.Tensor, num_results: int, image_index):
-    query = query.to("cpu")  # TODO: remove this when we move to GPU
-    if (
-        query.ndim == 3
-    ):  # query is in form (batch_size, 1, embedding_size), needs to be (batch_size, embedding_size)
-        query = query.squeeze(1)
-    query /= query.norm(dim=-1, keepdim=True)
-    query_embeddings = query.squeeze(0).cpu().detach().numpy().astype(np.float32)
+    if query.dim() == 3:  # (b, 1, d)
+        query = query.squeeze(1)  # need to expand to (b, d)
+    query_embeddings = query.cpu().detach().numpy().astype(np.float32)
     distances, indices, embeddings = image_index.search_and_reconstruct(
         query_embeddings, num_results
     )
@@ -90,39 +84,16 @@ def load_model_from_config(config, ckpt, verbose=False):
     return model
 
 
-def map_to_metadata(
-    indices, distances, num_images, metadata_provider, columns_to_return=["url"]
-):
-    results = []
-    associated_metadata = metadata_provider.get(indices[:num_images])
-    for key, (dist, ind) in enumerate(zip(distances, indices)):
-        output = {}
-        meta = None if key + 1 > len(associated_metadata) else associated_metadata[key]
-        # convert_metadata_to_base64(meta) # TODO
-        if meta is not None:
-            output.update(meta_to_dict(meta))
-        output["id"] = ind.item()
-        output["similarity"] = dist.item()
-        print(output)
-        results.append(output)
-    print(len(results))
-    return results
-
-
 def build_searcher(database_name: str):
     image_index_path = Path(
         "data", "rdm", "faiss_indices", database_name, "image.index"
     )
     assert image_index_path.exists(), f"database at {image_index_path} does not exist"
     print(f"Loading semantic index from {image_index_path}")
-    metadata_path = Path("data", "rdm", "faiss_indices", database_name, "metadata")
     return {
         "image_index": load_index(
             str(image_index_path), enable_faiss_memory_mapping=True
-        ),
-        "metadata_provider": ParquetMetadataProvider(str(metadata_path))
-        if metadata_path.exists()
-        else None,
+        )
     }
 
 
@@ -141,7 +112,6 @@ class Predictor(BasePredictor):
 
     @torch.inference_mode()
     def setup(self):
-        torch.backends.cudnn.enabled = True
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = True
         self.device = (
@@ -169,7 +139,7 @@ class Predictor(BasePredictor):
         self,
         prompts: str = Input(
             default="",
-            description="(batched) Text to generate. Use multiple prompts with a pipe `|` character. Limit 8 prompts/generations per run. Repeat prompts separated by `|` as needed.",
+            description="(batched) Use up to 8 prompts by separating with a `|` character.",
         ),
         database_name: str = Input(
             default="laion-aesthetic",
@@ -198,7 +168,7 @@ class Predictor(BasePredictor):
         ),
         num_database_results: int = Input(
             default=10,
-            description="The number of search results to guide the generation with. Using more will 'broaden' capabilities of the model at the risk of causing mode collapse or artifacting.",
+            description="The number of search results from the retrieval backend to guide the generation with.",
             ge=1,
             le=20,
         ),
@@ -224,12 +194,7 @@ class Predictor(BasePredictor):
             default=-1,
             description="Seed for the random number generator. Set to -1 to use a random seed.",
         ),
-        full_batch: bool = Input(
-            default=False,
-            description="Use to always generate a full batch of 8 by repeating provided prompts.",
-        ),
     ) -> List[CaptionedImage]:
-        assert len(prompts) != 0, "Prompt must be longer than 0 characters"
         set_seed(seed)
         if ddim_sampling:
             print("Using ddim sampling")
@@ -238,13 +203,15 @@ class Predictor(BasePredictor):
             print("Using plms sampling")
             sampler = PLMSSampler(self.model)
 
-        prompts = [prompt.strip() for prompt in prompts.split("|")]
-        print(f"Found {len(prompts)} prompts: {prompts}")
-
-        if len(prompts) < PROMPT_UPPER_BOUND and full_batch:
-            prompts = [prompts[i % len(prompts)] for i in range(PROMPT_UPPER_BOUND)]
+        prompts = prompts.split("|")
+        if len(prompts) == 0:
+            raise ValueError("No prompts provided")
+        if len(prompts) > PROMPT_UPPER_BOUND:
+            raise ValueError("You can only use up to 8 prompts. Try again using fewer `|` separators. Make sure to remove `|` characters from your captions if they are present.")
+        print(f"Prompts: {prompts}")
 
         clip_text_embed = self.clip_text_model.encode(prompts)
+        print(f"CLIP Text Embed: {clip_text_embed.shape}")
 
         if use_database:
             if database_name not in self.searchers:  # Load any new searchers
