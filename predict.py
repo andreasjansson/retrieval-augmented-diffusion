@@ -1,3 +1,8 @@
+from importlib.metadata import metadata
+import warnings
+
+warnings.filterwarnings("ignore")
+
 import sys
 from functools import lru_cache
 
@@ -10,7 +15,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from clip_retrieval.clip_back import ParquetMetadataProvider, load_index, meta_to_dict
-from cog import BaseModel, BasePredictor, Input, Path
+from cog import BasePredictor, Input, Path
 from einops import rearrange, repeat
 from omegaconf import OmegaConf
 from PIL import Image
@@ -72,10 +77,10 @@ def map_to_metadata(
     indices, distances, num_images, metadata_provider, columns_to_return=["url"]
 ):
     results = []
-    metas = metadata_provider.get(indices[:num_images])
+    associated_metadata = metadata_provider.get(indices[:num_images])
     for key, (dist, ind) in enumerate(zip(distances, indices)):
         output = {}
-        meta = None if key + 1 > len(metas) else metas[key]
+        meta = None if key + 1 > len(associated_metadata) else associated_metadata[key]
         # convert_metadata_to_base64(meta) # TODO
         if meta is not None:
             output.update(meta_to_dict(meta))
@@ -88,11 +93,12 @@ def map_to_metadata(
 
 
 def build_searcher(database_name: str):
-    image_index_path = Path(f"data/rdm/searchers/{database_name}/image.index")
+    image_index_path = Path(
+        "data", "rdm", "faiss_indices", database_name, "image.index"
+    )
     assert image_index_path.exists(), f"database at {image_index_path} does not exist"
     print(f"Loading semantic index from {image_index_path}")
-
-    metadata_path = Path(f"data/rdm/searchers/{database_name}/metadata")
+    metadata_path = Path("data", "rdm", "searchers", database_name, "metadata")
     return {
         "image_index": load_index(
             str(image_index_path), enable_faiss_memory_mapping=True
@@ -127,23 +133,19 @@ class Predictor(BasePredictor):
 
         self.database_names = (
             [  # TODO you have to copy this to the predict arg any time it is changed.
-                "prompt-engineer",
                 "cars",
-                "openimages",
-                "faces",
-                "simulacra",
                 "coco",
-                "pixelart",
-                "food",
                 "country211",
-                "laion-aesthetic",
-                "vaporwave",
-                "pets",
                 "emotes",
+                "faces",
+                "food",
+                "laion-aesthetic",
+                "openimages",
                 "pokemon",
+                "prompt-engineer",
+                "simulacra",
             ]
         )
-
         self.searchers = {
             database_name: build_searcher(database_name)
             for database_name in self.database_names
@@ -183,21 +185,18 @@ class Predictor(BasePredictor):
         database_name: str = Input(
             default="laion-aesthetic",
             description="Which database to use for the semantic search. Different databases have different capabilities.",
-            choices=[
-                "prompt-engineer",
+            choices=[  # TODO you have to copy this to the predict arg any time it is changed.
                 "cars",
-                "openimages",
-                "faces",
-                "simulacra",
                 "coco",
-                "pixelart",
-                "food",
                 "country211",
-                "laion-aesthetic",
-                "vaporwave",
-                "pets",
                 "emotes",
+                "faces",
+                "food",
+                "laion-aesthetic",
+                "openimages",
                 "pokemon",
+                "prompt-engineer",
+                "simulacra",
             ],
         ),
         prompt_scale: float = Input(
@@ -212,7 +211,7 @@ class Predictor(BasePredictor):
         ),
         num_generations: int = Input(
             default=1,
-            description="Number of images to generate. Using more will make generation take longer.",  # TODO
+            description="Number of images to generate. Using more will make generation take longer.",
         ),
         height: int = Input(
             default=768, description="Desired height of generated images."
@@ -225,7 +224,7 @@ class Predictor(BasePredictor):
             description="How many steps to run the model for. Using more will make generation take longer. 50 tends to work well.",
         ),
     ) -> List[Path]:
-        self.outdir = Path(tempfile.mkdtemp())
+        self.output_directory = Path(tempfile.mkdtemp())
 
         prompt_embedding = encode_text_with_clip_model(
             text=prompt, clip_model=self.clip_model, normalize=True, device=self.device
@@ -258,26 +257,26 @@ class Predictor(BasePredictor):
             sample_conditioning = repeat(
                 sample_conditioning, "1 k d -> b k d", b=num_generations
             )
-        uncond_clip_embed = None
+        unconditional_clip_embed = None
         if prompt_scale != 1.0:
-            uncond_clip_embed = torch.zeros_like(sample_conditioning)
+            unconditional_clip_embed = torch.zeros_like(sample_conditioning)
         with self.model.ema_scope():
             shape = [
                 16,
                 height // 16,
                 width // 16,
             ]  # note: currently hardcoded for f16 model
-            samples_ddim, _ = self.sampler.sample(
+            samples, _ = self.sampler.sample(
                 S=steps,
                 conditioning=sample_conditioning,
                 batch_size=sample_conditioning.shape[0],
                 shape=shape,
                 verbose=False,
                 unconditional_guidance_scale=prompt_scale,
-                unconditional_conditioning=uncond_clip_embed,
+                unconditional_conditioning=unconditional_clip_embed,
                 # eta=0.0,
             )
-            decoded_generations = self.model.decode_first_stage(samples_ddim)
+            decoded_generations = self.model.decode_first_stage(samples)
         decoded_generations = torch.clamp(
             (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
         )
@@ -285,7 +284,9 @@ class Predictor(BasePredictor):
         generation_paths = []
         for idx, generation in enumerate(decoded_generations):
             generation = 255.0 * rearrange(generation.cpu().numpy(), "c h w -> h w c")
-            x_sample_target_path = self.outdir.joinpath(f"sample_{idx:03d}.png")
+            x_sample_target_path = self.output_directory.joinpath(
+                f"sample_{idx:03d}.png"
+            )
             pil_image = Image.fromarray(generation.astype(np.uint8))
             pil_image.save(x_sample_target_path, "png")
             pil_image.save(f"sample_{idx:03d}.png")
